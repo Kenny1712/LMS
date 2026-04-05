@@ -17,6 +17,8 @@ let musicPlaying = false;
 let messageFeed = [];
 let attendancePollId = null;
 let submissionsPollId = null;
+let presenceHeartbeatId = null;
+let statusRefreshId = null;
 let submissionAttachment = null;
 let activeSubmissionAssignmentId = null;
 
@@ -25,6 +27,13 @@ const MUSIC_KEY = "mindx_music";
 const DIRECT_CHAT_KEY = "mindx_direct_chat";
 const ATTENDANCE_CACHE_KEY = "mindx_attendance_cache";
 const SUBMISSIONS_CACHE_KEY = "mindx_submissions_cache";
+const LIVE_SYNC_INTERVAL_MS = 4000;
+const PRESENCE_HEARTBEAT_MS = 45000;
+const STATUS_REFRESH_MS = 30000;
+const LOGIN_PROVIDER_LABELS = {
+  "google.com": "Google",
+  password: "Email & password"
+};
 
 const roleLabel = { admin: "Admin", teacher: "Giáo viên", student: "Học sinh" };
 const $ = (id) => document.getElementById(id);
@@ -55,6 +64,17 @@ const messageSortValue = (m) => {
   if (m?.createdAt?.seconds) return m.createdAt.seconds * 1000;
   return dateValue(m?.createdAtText);
 };
+const firestoreTimeValue = (value) => {
+  if (!value) return 0;
+  if (value?.seconds) return value.seconds * 1000;
+  if (typeof value === "string") return dateValue(value);
+  if (value instanceof Date) return value.getTime();
+  return 0;
+};
+const formatDateTime = (value, fallback = "Vừa xong") => {
+  const time = firestoreTimeValue(value);
+  return time ? new Date(time).toLocaleString("vi-VN") : fallback;
+};
 const pageTitles = {
   overview: "Tổng quan",
   accounts: "Tài khoản",
@@ -82,14 +102,77 @@ const allowedPagesForRole = (role) => ({
 }[role || "student"]);
 
 function userActivityStatus(user) {
+  const activeAtMs = user?.lastActiveAtMs || 0;
   const activeTime = user?.lastActiveAt?.seconds
     ? user.lastActiveAt.seconds * 1000
-    : dateValue(user?.lastActiveText);
+    : activeAtMs || dateValue(user?.lastActiveText);
   const diff = now() - activeTime;
   if (!activeTime || diff > 1000 * 60 * 60 * 24) return { label: "Offline", tone: "offline" };
   if (diff <= 1000 * 60 * 5) return { label: "Đang hoạt động", tone: "online" };
   if (diff <= 1000 * 60 * 60) return { label: "Vừa hoạt động", tone: "recent" };
   return { label: "Hoạt động hôm nay", tone: "today" };
+}
+
+function getLoginProviders(user = currentUser) {
+  const profileProviders = Array.isArray(user?.loginProviders) ? user.loginProviders : [];
+  const authProviders = window.firebaseApp?.getProviderIds
+    ? window.firebaseApp.getProviderIds(window.firebaseApp.auth?.currentUser)
+    : [];
+  return Array.from(new Set([...profileProviders, ...authProviders].filter(Boolean)));
+}
+
+function getLoginProviderText(user = currentUser) {
+  const providers = getLoginProviders(user);
+  return providers.length
+    ? providers.map((providerId) => LOGIN_PROVIDER_LABELS[providerId] || providerId).join(" + ")
+    : "Chưa xác định";
+}
+
+function getLoginProviderHint(user = currentUser) {
+  const providers = getLoginProviders(user);
+  if (providers.includes("google.com") && providers.includes("password")) {
+    return "Tài khoản này đã có cả Google và email & password.";
+  }
+  if (providers.includes("google.com")) {
+    return "Tài khoản hiện đăng nhập bằng Google. Khi đổi mật khẩu, hệ thống sẽ thêm email & password làm cách đăng nhập thứ hai.";
+  }
+  if (providers.includes("password")) {
+    return "Tài khoản hiện đăng nhập bằng email & password. Bấm Liên kết Google để thêm Google làm cách đăng nhập thứ hai.";
+  }
+  return "Bạn có thể thêm Google hoặc email & password để đăng nhập linh hoạt hơn.";
+}
+
+function renderSecuritySummary() {
+  const badgeBox = $("securityProviderBadges");
+  const hint = $("securityProviderHint");
+  const status = $("securityStatus");
+  const linkGoogleBtn = $("linkGoogleBtn");
+  if (!badgeBox || !hint || !status) return;
+
+  const providers = getLoginProviders();
+  badgeBox.innerHTML = providers.length
+    ? providers.map((providerId) => `<span class="status-badge ${providerId === "google.com" ? "online" : "today"}">${esc(LOGIN_PROVIDER_LABELS[providerId] || providerId)}</span>`).join("")
+    : '<span class="status-badge offline">Chưa xác định</span>';
+  hint.innerText = getLoginProviderHint();
+  if (status.dataset.mode !== "action") {
+    status.innerText = `Cách đăng nhập hiện tại: ${getLoginProviderText()}.`;
+    status.dataset.mode = "summary";
+  }
+
+  if (linkGoogleBtn) {
+    const hasGoogleLogin = providers.includes("google.com");
+    linkGoogleBtn.disabled = hasGoogleLogin;
+    linkGoogleBtn.innerText = hasGoogleLogin ? "Google đã liên kết" : "Liên kết Google";
+  }
+}
+
+function refreshLiveStatusViews() {
+  if (!currentUser) return;
+  renderAccounts();
+  renderClassFormOptions();
+  renderSelectedClass();
+  renderSelectedClassEnhancements();
+  renderSecuritySummary();
 }
 
 function getAssignmentSubmission(assignment, studentId = currentUser?.uid) {
@@ -234,10 +317,21 @@ function resetAssignmentForm() {
 
 async function markUserActive() {
   if (!currentUser?.uid || !window.firebaseApp?.db) return;
+  const activeAtMs = Date.now();
+  const lastActiveText = new Date(activeAtMs).toLocaleString("vi-VN");
+  const localPatch = {
+    active: true,
+    lastActiveAtMs: activeAtMs,
+    lastActiveText
+  };
   try {
+    currentUser = { ...currentUser, ...localPatch };
+    users = users.map((user) => user.uid === currentUser.uid ? { ...user, ...localPatch } : user);
+    refreshLiveStatusViews();
     await window.firebaseApp.updateDoc(window.firebaseApp.doc(window.firebaseApp.db, "users", currentUser.uid), {
       lastActiveAt: window.firebaseApp.serverTimestamp(),
-      lastActiveText: new Date().toLocaleString("vi-VN"),
+      lastActiveAtMs: activeAtMs,
+      lastActiveText,
       active: true
     });
   } catch (e) {
@@ -247,6 +341,10 @@ async function markUserActive() {
 
 function setupPresenceTracking() {
   markUserActive();
+  if (presenceHeartbeatId) clearInterval(presenceHeartbeatId);
+  if (statusRefreshId) clearInterval(statusRefreshId);
+  presenceHeartbeatId = setInterval(markUserActive, PRESENCE_HEARTBEAT_MS);
+  statusRefreshId = setInterval(refreshLiveStatusViews, STATUS_REFRESH_MS);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") markUserActive();
   });
@@ -319,6 +417,7 @@ function renderShell() {
   $("userRoleBadge").innerText = roleLabel[currentUser.role];
   $("userRoleBadge").dataset.role = currentUser.role;
   $("welcomeText").innerText = `Xin chào ${currentUser.name || currentUser.email}`;
+  renderSecuritySummary();
   if (currentUser.role === "admin") {
     $("heroLabel").innerText = "Toàn quyền vận hành hệ thống";
     $("heroTitle").innerText = "Admin quản trị tài khoản, lớp học, chat, bài tập và leaderboard của toàn bộ nền tảng.";
@@ -395,10 +494,14 @@ function clearSubscriptions() {
   if (classChatUnsub) classChatUnsub();
   if (attendancePollId) clearInterval(attendancePollId);
   if (submissionsPollId) clearInterval(submissionsPollId);
+  if (presenceHeartbeatId) clearInterval(presenceHeartbeatId);
+  if (statusRefreshId) clearInterval(statusRefreshId);
   directChatUnsub = null;
   classChatUnsub = null;
   attendancePollId = null;
   submissionsPollId = null;
+  presenceHeartbeatId = null;
+  statusRefreshId = null;
 }
 
 async function apiJson(url, options = {}) {
@@ -522,8 +625,8 @@ function subscribeData() {
 
   loadAttendanceRecords();
   loadSubmissions();
-  attendancePollId = setInterval(loadAttendanceRecords, 10000);
-  submissionsPollId = setInterval(loadSubmissions, 10000);
+  attendancePollId = setInterval(loadAttendanceRecords, LIVE_SYNC_INTERVAL_MS);
+  submissionsPollId = setInterval(loadSubmissions, LIVE_SYNC_INTERVAL_MS);
 
   const messagesRef = currentUser.role === "admin"
     ? collection(db, "messages")
@@ -547,6 +650,7 @@ function renderOverview() {
   renderOverviewClassSpotlight();
   renderRecommendations();
   renderRecentActivity();
+  renderSecuritySummary();
 }
 
 function renderOverviewInsight() {
@@ -660,24 +764,24 @@ function renderRecentActivity() {
   const activity = [];
 
   latest(visibleAssignments().map((a) => ({
-    sortValue: dateValue(a.dueDate),
-    time: a.dueDate || "Sắp tới",
+    sortValue: firestoreTimeValue(a.createdAt) || dateValue(a.createdAtIso) || dateValue(a.createdAtText) || dateValue(a.openDate) || dateValue(a.dueDate),
+    time: a.createdAtText || formatDateTime(a.createdAt, a.openDate || a.dueDate || "Sắp tới"),
     title: `Bài tập: ${a.title}`,
-    text: `${a.className || "Lớp học"} â€¢ Hạn nộp ${a.dueDate || "---"}`
+    text: `${a.className || "Lớp học"} • Hạn nộp ${a.dueDate || "---"}`
   })), 2).forEach((item) => activity.push(item));
 
   latest(visibleSubmissions().map((s) => ({
     sortValue: submissionTimeValue(s),
     time: s.submittedAtText || "Vừa xong",
     title: `Bài nộp: ${s.assignmentTitle}`,
-    text: `${s.studentName || "Học sinh"} â€¢ ${s.className || "Lớp học"}`
+    text: `${s.studentName || "Học sinh"} • ${s.className || "Lớp học"}`
   })), 3).forEach((item) => activity.push(item));
 
   latest(attendanceRecords.filter((a) => new Set(visibleClasses().map((c) => c.id)).has(a.classId)).map((a) => ({
-    sortValue: dateValue(a.date),
-    time: a.date || "Hôm nay",
+    sortValue: dateValue(a.savedAtIso) || dateValue(a.updatedAtIso) || dateValue(a.savedAtText) || dateValue(a.date),
+    time: a.savedAtText || (a.savedAtIso ? formatDateTime(a.savedAtIso, a.date || "Hôm nay") : (a.date || "Hôm nay")),
     title: `Điểm danh: ${a.className}`,
-    text: `${(a.records || []).length} học sinh â€¢ ${a.savedByName || "Người dùng"}`
+    text: `${(a.records || []).length} học sinh • ${a.savedByName || "Người dùng"}`
   })), 2).forEach((item) => activity.push(item));
 
   const items = latest(activity, 6);
@@ -1346,16 +1450,41 @@ async function submitAssignment() {
 
 async function changeOwnPassword() {
   const password = $("newPassword").value.trim();
+  const authUser = window.firebaseApp.auth.currentUser;
   if (!password || password.length < 6) {
     return alert("Mật khẩu mới phải có ít nhất 6 ký tự.");
   }
+  if (!authUser?.email) {
+    return alert("Tài khoản hiện chưa có email để thêm đăng nhập bằng mật khẩu.");
+  }
 
   try {
-    await window.firebaseApp.updatePassword(window.firebaseApp.auth.currentUser, password);
-    $("securityStatus").innerText = "Đổi mật khẩu thành công.";
+    const hasPasswordLogin = getLoginProviders().includes("password");
+    if (hasPasswordLogin) {
+      await window.firebaseApp.updatePassword(authUser, password);
+      $("securityStatus").innerText = "Đã đổi mật khẩu thành công.";
+    } else {
+      const credential = window.firebaseApp.EmailAuthProvider.credential(authUser.email, password);
+      await window.firebaseApp.linkWithCredential(authUser, credential);
+      $("securityStatus").innerText = "Đã thêm email & password làm cách đăng nhập thứ hai.";
+    }
+    $("securityStatus").dataset.mode = "action";
+    const authMetadata = await window.firebaseApp.syncUserAuthMetadata(authUser, currentUser);
+    currentUser = { ...currentUser, ...authMetadata };
     $("newPassword").value = "";
+    renderSecuritySummary();
   } catch (e) {
     console.error(e);
+    if (e.code === "auth/requires-recent-login") {
+      alert("Phiên đăng nhập đã cũ. Vui lòng đăng xuất rồi đăng nhập lại trước khi đổi mật khẩu.");
+      return;
+    }
+    if (e.code === "auth/provider-already-linked" || e.code === "auth/email-already-in-use") {
+      $("securityStatus").innerText = "Đăng nhập email & password đã được thêm trước đó.";
+      $("securityStatus").dataset.mode = "action";
+      renderSecuritySummary();
+      return;
+    }
     alert(e.message || "Không đổi được mật khẩu.");
   }
 }
@@ -1363,9 +1492,27 @@ async function changeOwnPassword() {
 async function linkGoogleAccount() {
   try {
     await window.firebaseApp.linkWithPopup(window.firebaseApp.auth.currentUser, window.firebaseApp.googleProvider);
-    $("securityStatus").innerText = "Đã liên kết tài khoản Google thành công.";
+    const authMetadata = await window.firebaseApp.syncUserAuthMetadata(window.firebaseApp.auth.currentUser, currentUser);
+    currentUser = { ...currentUser, ...authMetadata };
+    $("securityStatus").innerText = "Đã thêm Google làm cách đăng nhập thứ hai.";
+    $("securityStatus").dataset.mode = "action";
+    renderSecuritySummary();
   } catch (e) {
     console.error(e);
+    if (e.code === "auth/provider-already-linked") {
+      $("securityStatus").innerText = "Tài khoản này đã liên kết Google từ trước.";
+      $("securityStatus").dataset.mode = "action";
+      renderSecuritySummary();
+      return;
+    }
+    if (e.code === "auth/credential-already-in-use") {
+      alert("Tài khoản Google này đang liên kết với người dùng khác.");
+      return;
+    }
+    if (e.code === "auth/requires-recent-login") {
+      alert("Phiên đăng nhập đã cũ. Vui lòng đăng xuất rồi đăng nhập lại trước khi liên kết Google.");
+      return;
+    }
     alert(e.message || "Không liên kết được Google.");
   }
 }
@@ -1482,7 +1629,12 @@ async function saveAssignment() {
       if (!canManageAssignment(target)) throw new Error("Bạn không có quyền sửa bài tập này.");
       await window.firebaseApp.updateDoc(window.firebaseApp.doc(window.firebaseApp.db, "assignments", editingAssignmentId), payload);
     } else {
-      await window.firebaseApp.addDoc(window.firebaseApp.collection(window.firebaseApp.db, "assignments"), { ...payload, createdAt: window.firebaseApp.serverTimestamp() });
+      await window.firebaseApp.addDoc(window.firebaseApp.collection(window.firebaseApp.db, "assignments"), {
+        ...payload,
+        createdAt: window.firebaseApp.serverTimestamp(),
+        createdAtIso: new Date().toISOString(),
+        createdAtText: new Date().toLocaleString("vi-VN")
+      });
     }
     resetAssignmentForm();
   } catch (e) {
@@ -2062,6 +2214,3 @@ window.exportClassStudents = exportClassStudents;
 window.openDirectChat = openDirectChat;
 window.sendDirectMessage = sendDirectMessage;
 window.sendClassMessage = sendClassMessage;
-
-
-

@@ -88,6 +88,10 @@
       const provider = new GoogleAuthProvider();
       provider.setCustomParameters({ prompt: "select_account" });
       const ADMIN_EMAILS = ["admin@learning-system.com"];
+      const LOGIN_PROVIDER_LABELS = {
+        "google.com": "Google",
+        password: "Email & password"
+      };
 
       const btnText = document.getElementById("btn-text");
       const btnLoader = document.getElementById("btn-loader");
@@ -98,17 +102,63 @@
         btnLoader.classList.toggle("hidden", !isLoading);
       }
 
-      async function ensureUserProfile(user, fallbackRole = "teacher") {
+      function uniqueProviderIds(items = []) {
+        return Array.from(new Set(items.filter(Boolean)));
+      }
+
+      function getProviderIds(user) {
+        return uniqueProviderIds((user?.providerData || []).map((item) => item?.providerId));
+      }
+
+      function getLoginMethodText(providerIds = []) {
+        const labels = uniqueProviderIds(providerIds).map((providerId) => LOGIN_PROVIDER_LABELS[providerId] || providerId);
+        return labels.length ? labels.join(" + ") : "Chưa xác định";
+      }
+
+      async function syncUserAuthMetadata(user, existingProfile = {}) {
+        const providerIds = getProviderIds(user);
+        const mergedProviderIds = uniqueProviderIds([...(existingProfile.loginProviders || []), ...providerIds]);
+        const primaryLoginMethod = mergedProviderIds.includes("google.com")
+          ? "google"
+          : mergedProviderIds.includes("password")
+            ? "password"
+            : "unknown";
+
+        const payload = {
+          uid: user.uid,
+          name: user.displayName || existingProfile.name || user.email?.split("@")[0] || "Người dùng",
+          email: user.email || existingProfile.email || "",
+          loginProviders: mergedProviderIds,
+          primaryLoginMethod,
+          loginMethodText: getLoginMethodText(mergedProviderIds),
+          hasGoogleLogin: mergedProviderIds.includes("google.com"),
+          hasPasswordLogin: mergedProviderIds.includes("password")
+        };
+
+        await setDoc(doc(db, "users", user.uid), payload, { merge: true });
+        return payload;
+      }
+
+      async function ensureUserProfile(user, fallbackRole = "student") {
         const ref = doc(db, "users", user.uid);
         const snap = await getDoc(ref);
+        const providerIds = getProviderIds(user);
+        const role = ADMIN_EMAILS.includes(user.email)
+          ? "admin"
+          : providerIds.includes("google.com")
+            ? "student"
+            : fallbackRole;
 
         if (snap.exists()) {
           const profile = snap.data();
           if (profile.active === false) throw new Error("Tài khoản đã bị vô hiệu hóa.");
-          return profile;
+          const authMetadata = await syncUserAuthMetadata(user, profile);
+          return {
+            ...profile,
+            ...authMetadata
+          };
         }
 
-        const role = ADMIN_EMAILS.includes(user.email) ? "admin" : fallbackRole;
         const profile = {
           uid: user.uid,
           name: user.displayName || user.email?.split("@")[0] || "Người dùng",
@@ -116,7 +166,12 @@
           role,
           active: true,
           xp: 0,
-          createdAt: serverTimestamp()
+          createdAt: serverTimestamp(),
+          loginProviders: providerIds,
+          primaryLoginMethod: providerIds.includes("google.com") ? "google" : "password",
+          loginMethodText: getLoginMethodText(providerIds),
+          hasGoogleLogin: providerIds.includes("google.com"),
+          hasPasswordLogin: providerIds.includes("password")
         };
 
         await setDoc(ref, profile);

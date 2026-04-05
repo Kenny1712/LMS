@@ -173,9 +173,14 @@
               <label for="newPassword">Mật khẩu mới</label>
               <input id="newPassword" type="password" placeholder="Nhập mật khẩu mới">
             </div>
+            <div class="security-summary">
+              <p class="section-label">Cách đăng nhập hiện có</p>
+              <div id="securityProviderBadges" class="security-provider-badges"></div>
+              <p id="securityProviderHint" class="muted-text">Đang kiểm tra phương thức đăng nhập...</p>
+            </div>
             <div class="action-row">
-              <button class="primary-btn" onclick="changeOwnPassword()">Đổi mật khẩu</button>
-              <button class="secondary-btn" onclick="linkGoogleAccount()">Liên kết Google</button>
+              <button id="changePasswordBtn" class="primary-btn" onclick="changeOwnPassword()">Đổi mật khẩu</button>
+              <button id="linkGoogleBtn" class="secondary-btn" onclick="linkGoogleAccount()">Liên kết Google</button>
             </div>
             <p id="securityStatus" class="muted-text">Bạn có thể đổi mật khẩu và liên kết tài khoản Google để đăng nhập nhanh hơn.</p>
           </div>
@@ -461,7 +466,9 @@
       signOut,
       onAuthStateChanged,
       createUserWithEmailAndPassword,
+      EmailAuthProvider,
       GoogleAuthProvider,
+      linkWithCredential,
       linkWithPopup,
       updatePassword
     } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-auth.js";
@@ -495,20 +502,70 @@
     const db = getFirestore(app);
     const ADMIN_EMAILS = ["admin@learning-system.com"];
     const googleProvider = new GoogleAuthProvider();
+    const LOGIN_PROVIDER_LABELS = {
+      "google.com": "Google",
+      password: "Email & password"
+    };
 
-    async function ensureUserProfile(user, fallbackRole = "teacher") {
+    function uniqueProviderIds(items = []) {
+      return Array.from(new Set(items.filter(Boolean)));
+    }
+
+    function getProviderIds(user) {
+      return uniqueProviderIds((user?.providerData || []).map((item) => item?.providerId));
+    }
+
+    function getLoginMethodText(providerIds = []) {
+      const labels = uniqueProviderIds(providerIds).map((providerId) => LOGIN_PROVIDER_LABELS[providerId] || providerId);
+      return labels.length ? labels.join(" + ") : "Chưa xác định";
+    }
+
+    async function syncUserAuthMetadata(user, existingProfile = {}) {
+      const providerIds = getProviderIds(user);
+      const mergedProviderIds = uniqueProviderIds([...(existingProfile.loginProviders || []), ...providerIds]);
+      const primaryLoginMethod = mergedProviderIds.includes("google.com")
+        ? "google"
+        : mergedProviderIds.includes("password")
+          ? "password"
+          : "unknown";
+
+      const payload = {
+        uid: user.uid,
+        name: user.displayName || existingProfile.name || user.email?.split("@")[0] || "Người dùng",
+        email: user.email || existingProfile.email || "",
+        loginProviders: mergedProviderIds,
+        primaryLoginMethod,
+        loginMethodText: getLoginMethodText(mergedProviderIds),
+        hasGoogleLogin: mergedProviderIds.includes("google.com"),
+        hasPasswordLogin: mergedProviderIds.includes("password")
+      };
+
+      await setDoc(doc(db, "users", user.uid), payload, { merge: true });
+      return payload;
+    }
+
+    async function ensureUserProfile(user, fallbackRole = "student") {
       const userRef = doc(db, "users", user.uid);
       const snap = await getDoc(userRef);
+      const providerIds = getProviderIds(user);
+      const role = ADMIN_EMAILS.includes(user.email)
+        ? "admin"
+        : providerIds.includes("google.com")
+          ? "student"
+          : fallbackRole;
 
       if (snap.exists()) {
         const profile = snap.data();
         if (profile.active === false) {
           throw new Error("Tài khoản đã bị vô hiệu hóa.");
         }
-        return profile;
+        const authMetadata = await syncUserAuthMetadata(user, profile);
+        return {
+          ...profile,
+          ...authMetadata
+        };
       }
 
-      const role = ADMIN_EMAILS.includes(user.email) ? "admin" : fallbackRole;
       const profile = {
         uid: user.uid,
         name: user.displayName || user.email?.split("@")[0] || "Người dùng",
@@ -516,7 +573,12 @@
         role,
         active: true,
         xp: 0,
-        createdAt: serverTimestamp()
+        createdAt: serverTimestamp(),
+        loginProviders: providerIds,
+        primaryLoginMethod: providerIds.includes("google.com") ? "google" : "password",
+        loginMethodText: getLoginMethodText(providerIds),
+        hasGoogleLogin: providerIds.includes("google.com"),
+        hasPasswordLogin: providerIds.includes("password")
       };
 
       await setDoc(userRef, profile);
@@ -538,7 +600,12 @@
           role,
           active: true,
           xp: 0,
-          createdAt: serverTimestamp()
+          createdAt: serverTimestamp(),
+          loginProviders: ["password"],
+          primaryLoginMethod: "password",
+          loginMethodText: getLoginMethodText(["password"]),
+          hasGoogleLogin: false,
+          hasPasswordLogin: true
         });
 
         return user;
@@ -563,11 +630,16 @@
       query,
       where,
       orderBy,
+      EmailAuthProvider,
+      linkWithCredential,
       linkWithPopup,
       updatePassword,
       googleProvider,
       createManagedAccount,
-      ensureUserProfile
+      ensureUserProfile,
+      getProviderIds,
+      getLoginMethodText,
+      syncUserAuthMetadata
     };
 
     onAuthStateChanged(auth, async (user) => {
